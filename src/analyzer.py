@@ -604,75 +604,96 @@ class GeminiAnalyzer:
         """Check if LiteLLM is properly configured with at least one API key."""
         return self._router is not None or self._litellm_available
 
-    def _call_litellm(self, prompt: str, generation_config: dict) -> str:
-        """Call LLM via litellm with fallback across configured models.
+   def _call_litellm(self, prompt: str, generation_config: dict) -> str:
+    """Call LLM via litellm with fallback across configured models.
 
-        When channels/YAML are configured, every model goes through the Router
-        (which handles per-model key selection, load balancing, and retries).
-        In legacy mode, the primary model may use the Router while fallback
-        models fall back to direct litellm.completion().
+    When channels/YAML are configured, every model goes through the Router
+    (which handles per-model key selection, load balancing, and retries).
+    In legacy mode, the primary model may use the Router while fallback
+    models fall back to direct litellm.completion().
 
-        Args:
-            prompt: User prompt text.
-            generation_config: Dict with optional keys: temperature, max_output_tokens, max_tokens.
+    Args:
+        prompt: User prompt text.
+        generation_config: Dict with optional keys: temperature, max_output_tokens, max_tokens.
 
-        Returns:
-            Response text from LLM.
-        """
-        config = get_config()
-        max_tokens = (
-            generation_config.get('max_output_tokens')
-            or generation_config.get('max_tokens')
-            or 8192
-        )
-        temperature = generation_config.get('temperature', 0.7)
+    Returns:
+        Response text from LLM.
+    """
+    config = get_config()
+    max_tokens = (
+        generation_config.get('max_output_tokens')
+        or generation_config.get('max_tokens')
+        or 8192
+    )
+    temperature = generation_config.get('temperature', 0.7)
 
-        models_to_try = [config.litellm_model] + (config.litellm_fallback_models or [])
-        models_to_try = [m for m in models_to_try if m]
+    # ===== 修改点：定义免费模型列表（按优先级排序）=====
+    free_models = [
+        "openai/gemini-3-flash-preview-free",           # 主模型 - Gemini 3 Flash
+        "openai/gemini-3.1-flash-image-preview-free",   # 备选1 - Gemini 3.1 图像版
+        "openai/coding-glm-5-free",                      # 备选2 - 智谱代码模型
+        "openai/gpt-4o-free",                            # 备选3 - GPT-4o 免费版
+        "openai/kimi-for-coding-free",                    # 备选4 - Kimi 免费版
+        "openai/glm-4-32b-0414"                          # 备选5 - 智谱搜索优化模型
+    ]
+    
+    # 使用定义的免费模型列表，忽略配置文件中的模型
+    models_to_try = free_models
+    
+    use_channel_router = self._has_channel_config(config)
 
-        use_channel_router = self._has_channel_config(config)
+    last_error = None
+    for model in models_to_try:
+        try:
+            logger.info(f"========== 尝试使用模型: {model} ==========")
+            model_short = model.split("/")[-1] if "/" in model else model
+            call_kwargs: Dict[str, Any] = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            extra = get_thinking_extra_body(model_short)
+            if extra:
+                call_kwargs["extra_body"] = extra
 
-        last_error = None
-        for model in models_to_try:
-            try:
-                model_short = model.split("/")[-1] if "/" in model else model
-                call_kwargs: Dict[str, Any] = {
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": self.SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                }
-                extra = get_thinking_extra_body(model_short)
-                if extra:
-                    call_kwargs["extra_body"] = extra
+            if use_channel_router and self._router:
+                # Channel / YAML path: Router manages key + base_url per model
+                logger.info(f"使用 Router 调用模型: {model}")
+                response = self._router.completion(**call_kwargs)
+            elif self._router and model == config.litellm_model:
+                # Legacy path: Router only for primary model multi-key
+                logger.info(f"使用 Legacy Router 调用模型: {model}")
+                response = self._router.completion(**call_kwargs)
+            else:
+                # Legacy path: direct call for fallback models
+                logger.info(f"直接调用模型: {model}")
+                keys = get_api_keys_for_model(model, config)
+                if keys:
+                    call_kwargs["api_key"] = keys[0]
+                call_kwargs.update(extra_litellm_params(model, config))
+                response = litellm.completion(**call_kwargs)
 
-                if use_channel_router and self._router:
-                    # Channel / YAML path: Router manages key + base_url per model
-                    response = self._router.completion(**call_kwargs)
-                elif self._router and model == config.litellm_model:
-                    # Legacy path: Router only for primary model multi-key
-                    response = self._router.completion(**call_kwargs)
-                else:
-                    # Legacy path: direct call for fallback models
-                    keys = get_api_keys_for_model(model, config)
-                    if keys:
-                        call_kwargs["api_key"] = keys[0]
-                    call_kwargs.update(extra_litellm_params(model, config))
-                    response = litellm.completion(**call_kwargs)
+            if response and response.choices and response.choices[0].message.content:
+                logger.info(f"模型 {model} 调用成功")
+                return response.choices[0].message.content
+            raise ValueError("LLM returned empty response")
 
-                if response and response.choices and response.choices[0].message.content:
-                    return response.choices[0].message.content
-                raise ValueError("LLM returned empty response")
+        except Exception as e:
+            logger.warning(f"[LiteLLM] 模型 {model} 失败: {e}")
+            # 如果是配额用完的错误，记录更明确的信息
+            if "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                logger.warning(f"模型 {model} 配额用完，自动切换到下一个模型")
+            last_error = e
+            continue
 
-            except Exception as e:
-                logger.warning(f"[LiteLLM] {model} failed: {e}")
-                last_error = e
-                continue
-
-        raise Exception(f"All LLM models failed (tried {len(models_to_try)} model(s)). Last error: {last_error}")
+    # 所有模型都失败
+    error_msg = f"所有 LLM 模型都失败 (尝试了 {len(models_to_try)} 个模型)。最后一个错误: {last_error}"
+    logger.error(error_msg)
+    raise Exception(error_msg)
 
     def generate_text(
         self,
